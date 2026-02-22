@@ -2,20 +2,18 @@ use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
-use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Maximum time to wait for a screenshot command to complete.
 const SCREENSHOT_TIMEOUT_SECS: u64 = 15;
-/// Maximum base64 payload size to return (2 MB of base64 ≈ 1.5 MB image).
-const MAX_BASE64_BYTES: usize = 2_097_152;
 
 /// Tool for capturing screenshots using platform-native commands.
 ///
 /// macOS: `screencapture`
 /// Linux: tries `gnome-screenshot`, `scrot`, `import` (`ImageMagick`) in order.
+/// Windows: PowerShell with `System.Windows.Forms` screen capture.
 pub struct ScreenshotTool {
     security: Arc<SecurityPolicy>,
 }
@@ -47,6 +45,23 @@ impl ScreenshotTool {
                      else \
                          echo 'NO_SCREENSHOT_TOOL' >&2; exit 1; \
                      fi"
+                ),
+            ])
+        } else if cfg!(target_os = "windows") {
+            Some(vec![
+                "powershell".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                format!(
+                    "Add-Type -AssemblyName System.Windows.Forms; \
+                     $bmp = [System.Windows.Forms.Screen]::PrimaryScreen; \
+                     $bounds = $bmp.Bounds; \
+                     $bitmap = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height); \
+                     $graphics = [System.Drawing.Graphics]::FromImage($bitmap); \
+                     $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size); \
+                     $bitmap.Save('{output_path}'); \
+                     $graphics.Dispose(); \
+                     $bitmap.Dispose()"
                 ),
             ])
         } else {
@@ -149,63 +164,34 @@ impl ScreenshotTool {
         }
     }
 
-    /// Read the screenshot file and return base64-encoded result.
+    /// Verify the screenshot file was written and return a path-only result.
+    ///
+    /// Previously this method read the entire file and base64-encoded it into
+    /// the tool result.  That caused massive slowdowns because the LLM had to
+    /// tokenise megabytes of base64 text — the multimodal `[IMAGE:]` pipeline
+    /// only processes `role: "user"` messages, so the data was never converted
+    /// to a native image block anyway.
+    ///
+    /// Now we just confirm the file exists and return its path + size.  If the
+    /// agent (or user) needs the LLM to *see* the image, they can reference it
+    /// via `[IMAGE:/path]` in a follow-up user message.
     async fn read_and_encode(output_path: &std::path::Path) -> anyhow::Result<ToolResult> {
-        // Check file size before reading to prevent OOM on large screenshots
-        const MAX_RAW_BYTES: u64 = 1_572_864; // ~1.5 MB (base64 expands ~33%)
-        if let Ok(meta) = tokio::fs::metadata(output_path).await {
-            if meta.len() > MAX_RAW_BYTES {
-                return Ok(ToolResult {
-                    success: true,
-                    output: format!(
-                        "Screenshot saved to: {}\nSize: {} bytes (too large to base64-encode inline)",
-                        output_path.display(),
-                        meta.len(),
-                    ),
-                    error: None,
-                });
-            }
-        }
-
-        match tokio::fs::read(output_path).await {
-            Ok(bytes) => {
-                use base64::Engine;
-                let size = bytes.len();
-                let mut encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                let truncated = if encoded.len() > MAX_BASE64_BYTES {
-                    encoded.truncate(encoded.floor_char_boundary(MAX_BASE64_BYTES));
-                    true
-                } else {
-                    false
-                };
-
-                let mut output_msg = format!(
-                    "Screenshot saved to: {}\nSize: {size} bytes\nBase64 length: {}",
+        match tokio::fs::metadata(output_path).await {
+            Ok(meta) => Ok(ToolResult {
+                success: true,
+                output: format!(
+                    "Screenshot saved to: {}\nSize: {} bytes",
                     output_path.display(),
-                    encoded.len(),
-                );
-                if truncated {
-                    output_msg.push_str(" (truncated)");
-                }
-                let mime = match output_path.extension().and_then(|e| e.to_str()) {
-                    Some("jpg" | "jpeg") => "image/jpeg",
-                    Some("bmp") => "image/bmp",
-                    Some("gif") => "image/gif",
-                    Some("webp") => "image/webp",
-                    _ => "image/png",
-                };
-                let _ = write!(output_msg, "\ndata:{mime};base64,{encoded}");
-
-                Ok(ToolResult {
-                    success: true,
-                    output: output_msg,
-                    error: None,
-                })
-            }
+                    meta.len(),
+                ),
+                error: None,
+            }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: format!("Screenshot saved to: {}", output_path.display()),
-                error: Some(format!("Failed to read screenshot file: {e}")),
+                output: String::new(),
+                error: Some(format!(
+                    "Screenshot command succeeded but file not found: {e}"
+                )),
             }),
         }
     }
@@ -218,7 +204,7 @@ impl Tool for ScreenshotTool {
     }
 
     fn description(&self) -> &str {
-        "Capture a screenshot of the current screen. Returns the file path and base64-encoded PNG data."
+        "Capture a screenshot of the current screen. Returns the file path of the saved PNG."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -292,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     fn screenshot_command_exists() {
         let cmd = ScreenshotTool::screenshot_command("/tmp/test.png");
         assert!(cmd.is_some());

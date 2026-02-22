@@ -2553,8 +2553,20 @@ pub(crate) async fn run_tool_call_loop(
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
+        let mut screenshot_paths: Vec<String> = Vec::new();
         for entry in ordered_results {
             if let Some((tool_name, tool_call_id, outcome)) = entry {
+                // Track successful screenshot paths for vision follow-up.
+                if tool_name == "screenshot" && outcome.success {
+                    if let Some(path) = outcome.output.strip_prefix("Screenshot saved to: ") {
+                        if let Some(p) = path.lines().next() {
+                            let p = p.trim();
+                            if !p.is_empty() {
+                                screenshot_paths.push(p.to_string());
+                            }
+                        }
+                    }
+                }
                 individual_results.push((tool_call_id, outcome.output.clone()));
                 let _ = writeln!(
                     tool_results,
@@ -2595,6 +2607,18 @@ pub(crate) async fn run_tool_call_loop(
                     "content": result,
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
+            }
+        }
+
+        // ── Vision follow-up: inject [IMAGE:] for screenshot results ────
+        // The multimodal pipeline only processes `role: "user"` messages, so
+        // image data in tool-role messages is invisible to vision models.
+        // When the provider supports vision and a screenshot tool succeeded,
+        // append a lightweight user message with the `[IMAGE:path]` marker so
+        // the LLM can actually see the captured image on the next round.
+        if provider.supports_vision() {
+            for path in &screenshot_paths {
+                history.push(ChatMessage::user(format!("[IMAGE:{path}]")));
             }
         }
     }
@@ -2819,7 +2843,7 @@ pub async fn run(
     tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
     tool_descs.push((
         "screenshot",
-        "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
+        "Capture a screenshot of the current screen. Returns the file path of the saved PNG. Use when: visual verification, UI inspection, debugging displays.",
     ));
     tool_descs.push((
         "image_info",
