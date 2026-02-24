@@ -22,10 +22,10 @@ const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 ///
 /// Each locale pool is a curated subset of the same global identifier space,
 /// chosen for cultural fit.
-const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &["OK", "THUMBSUP", "CLAP", "FISTBUMP", "MUSCLE", "JIAYI", "FIGHT"];
-const LARK_ACK_REACTIONS_ZH_TW: &[&str] = &["OK", "THUMBSUP", "CLAP", "FISTBUMP", "MUSCLE", "JIAYI", "FIGHT"];
-const LARK_ACK_REACTIONS_EN: &[&str] = &["OK", "THUMBSUP", "CLAP", "FISTBUMP", "MUSCLE", "JIAYI", "SMILE"];
-const LARK_ACK_REACTIONS_JA: &[&str] = &["OK", "THUMBSUP", "CLAP", "FISTBUMP", "MUSCLE", "JIAYI", "FIGHT"];
+const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &["OK", "THUMBSUP", "CLAP", "FISTBUMP", "MUSCLE", "DONE", "OnIt", "YEAH", "JOYFUL", "GoGoGo", "HIGHFIVE", "AWESOMEN", "THINKING", "GLANCE", "SMILE", "SMIRK", "SOB", "SPEECHLESS", "Get", "MeMeMe", "BLUBBER", "CRAZY", "LOOKDOWN", "DIZZY", "WITTY"];
+const LARK_ACK_REACTIONS_ZH_TW: &[&str] = &["OK", "THUMBSUP", "CLAP", "FISTBUMP", "MUSCLE", "DONE", "OnIt", "YEAH", "JOYFUL", "GoGoGo", "HIGHFIVE", "AWESOMEN", "THINKING", "GLANCE", "SMILE", "SMIRK", "SOB", "SPEECHLESS", "Get", "MeMeMe", "BLUBBER", "CRAZY", "LOOKDOWN", "DIZZY", "WITTY"];
+const LARK_ACK_REACTIONS_EN: &[&str] = &["OK", "THUMBSUP", "CLAP", "FISTBUMP", "LGTM", "DONE", "OnIt", "YEAH", "JOYFUL", "GoGoGo", "HIGHFIVE", "AWESOMEN", "THINKING", "GLANCE", "SMILE", "SMIRK", "SOB", "SPEECHLESS", "Get", "MeMeMe", "BLUBBER", "CRAZY", "LOOKDOWN", "DIZZY", "WITTY"];
+const LARK_ACK_REACTIONS_JA: &[&str] = &["OK", "THUMBSUP", "CLAP", "FISTBUMP", "MUSCLE", "DONE", "OnIt", "YEAH", "JOYFUL", "GoGoGo", "HIGHFIVE", "AWESOMEN", "THINKING", "GLANCE", "SMILE", "SMIRK", "SOB", "SPEECHLESS", "Get", "MeMeMe", "BLUBBER", "CRAZY", "LOOKDOWN", "DIZZY", "WITTY"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LarkAckLocale {
@@ -860,6 +860,64 @@ impl LarkChannel {
         let parsed = serde_json::from_str::<serde_json::Value>(&raw)
             .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
         Ok((status, parsed))
+    }
+
+    /// Send a message with explicit `msg_type` and `receive_id_type`.
+    ///
+    /// For `msg_type = "text"`, `content` should be the raw text string (this
+    /// method wraps it in `{"text":"..."}` automatically). For all other types,
+    /// `content` must be the JSON-serialized content string as required by the
+    /// Lark API (e.g. post JSON, interactive card JSON, `{"image_key":"..."}`,
+    /// etc.).
+    ///
+    /// `receive_id_type` must be one of: `chat_id`, `open_id`, `union_id`,
+    /// `user_id`, `email`.
+    pub(crate) async fn send_raw_message(
+        &self,
+        receive_id: &str,
+        receive_id_type: &str,
+        msg_type: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        let token = self.get_tenant_access_token().await?;
+        let url = format!(
+            "{}/im/v1/messages?receive_id_type={receive_id_type}",
+            self.api_base()
+        );
+
+        let wire_content = if msg_type == "text" {
+            serde_json::json!({ "text": content }).to_string()
+        } else {
+            content.to_string()
+        };
+
+        let body = serde_json::json!({
+            "receive_id": receive_id,
+            "msg_type": msg_type,
+            "content": wire_content,
+        });
+
+        let (status, response) = self.send_text_once(&url, &token, &body).await?;
+
+        if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let (retry_status, retry_response) =
+                self.send_text_once(&url, &new_token, &body).await?;
+
+            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                anyhow::bail!(
+                    "Lark send_raw_message failed after token refresh: \
+                     status={retry_status}, body={retry_response}"
+                );
+            }
+
+            ensure_lark_send_success(retry_status, &retry_response, "send_raw after refresh")?;
+            return Ok(());
+        }
+
+        ensure_lark_send_success(status, &response, "send_raw")?;
+        Ok(())
     }
 
     /// Parse an event callback payload and extract text messages
