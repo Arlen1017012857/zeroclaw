@@ -261,6 +261,62 @@ fn ensure_lark_send_success(
     Ok(())
 }
 
+/// Extract `data.message_id` from a Lark API response body.
+fn extract_message_id(body: &serde_json::Value) -> anyhow::Result<String> {
+    body.pointer("/data/message_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("missing data.message_id in Lark response: {body}"))
+}
+
+/// Streaming update throttle state.
+#[derive(Default)]
+struct StreamingThrottleState {
+    /// Last time a streaming update was successfully sent.
+    last_update_time: Option<Instant>,
+    /// Text that was skipped due to throttling (sent on next eligible update).
+    pending_text: Option<String>,
+    /// Per-card sequence counters for CardKit update ordering.
+    sequences: HashMap<String, u64>,
+}
+
+/// Encode a card_id and message_id into a draft identifier.
+///
+/// Format: `card:{card_id}:msg:{message_id}`
+fn encode_draft_id(card_id: &str, message_id: &str) -> String {
+    format!("card:{card_id}:msg:{message_id}")
+}
+
+/// Decode a draft identifier into `(card_id, message_id)`.
+fn decode_draft_id(draft_id: &str) -> anyhow::Result<(&str, &str)> {
+    let rest = draft_id
+        .strip_prefix("card:")
+        .ok_or_else(|| anyhow::anyhow!("invalid draft id: missing 'card:' prefix"))?;
+    let (card_id, msg_part) = rest
+        .split_once(":msg:")
+        .ok_or_else(|| anyhow::anyhow!("invalid draft id: missing ':msg:' separator"))?;
+    if card_id.is_empty() || msg_part.is_empty() {
+        anyhow::bail!("invalid draft id: empty card_id or message_id");
+    }
+    Ok((card_id, msg_part))
+}
+
+/// Truncate summary text to at most `max_len` characters.
+///
+/// Newlines are replaced with spaces and the result is trimmed.
+/// If the cleaned text exceeds `max_len`, it is truncated to
+/// `max_len - 3` characters with `...` appended.
+fn truncate_summary(text: &str, max_len: usize) -> String {
+    let clean = text.replace('\n', " ").trim().to_string();
+    if clean.chars().count() <= max_len {
+        clean
+    } else {
+        let truncated: String = clean.chars().take(max_len - 3).collect();
+        format!("{truncated}...")
+    }
+}
+
+
 /// Lark/Feishu channel.
 ///
 /// Supports two receive modes (configured via `receive_mode` in config):
@@ -281,6 +337,10 @@ pub struct LarkChannel {
     tenant_token: Arc<RwLock<Option<CachedTenantToken>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Whether streaming card feature is enabled.
+    streaming_enabled: bool,
+    /// Streaming update throttle state (Mutex guarantees serial execution).
+    streaming_state: Arc<tokio::sync::Mutex<StreamingThrottleState>>,
 }
 
 impl LarkChannel {
@@ -298,6 +358,7 @@ impl LarkChannel {
             port,
             allowed_users,
             LarkPlatform::Lark,
+            true,
         )
     }
 
@@ -308,6 +369,7 @@ impl LarkChannel {
         port: Option<u16>,
         allowed_users: Vec<String>,
         platform: LarkPlatform,
+        streaming_enabled: bool,
     ) -> Self {
         Self {
             app_id,
@@ -319,6 +381,8 @@ impl LarkChannel {
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
+            streaming_enabled,
+            streaming_state: Arc::new(tokio::sync::Mutex::new(StreamingThrottleState::default())),
         }
     }
 
@@ -337,6 +401,7 @@ impl LarkChannel {
             config.port,
             config.allowed_users.clone(),
             platform,
+            config.streaming,
         );
         ch.receive_mode = config.receive_mode.clone();
         ch
@@ -351,6 +416,7 @@ impl LarkChannel {
             config.port,
             config.allowed_users.clone(),
             LarkPlatform::Lark,
+            config.streaming,
         );
         ch.receive_mode = config.receive_mode.clone();
         ch
@@ -365,6 +431,7 @@ impl LarkChannel {
             config.port,
             config.allowed_users.clone(),
             LarkPlatform::Feishu,
+            config.streaming,
         );
         ch.receive_mode = config.receive_mode.clone();
         ch
@@ -920,6 +987,218 @@ impl LarkChannel {
         Ok(())
     }
 
+    /// Send a message and return the `message_id` from the response.
+    /// Used by the streaming-card flow to obtain the message identifier
+    /// needed for draft-ID encoding.
+    pub(crate) async fn send_raw_message_with_id(
+        &self,
+        receive_id: &str,
+        receive_id_type: &str,
+        msg_type: &str,
+        content: &str,
+    ) -> anyhow::Result<String> {
+        let token = self.get_tenant_access_token().await?;
+        let url = format!(
+            "{}/im/v1/messages?receive_id_type={receive_id_type}",
+            self.api_base()
+        );
+
+        let wire_content = if msg_type == "text" {
+            serde_json::json!({ "text": content }).to_string()
+        } else {
+            content.to_string()
+        };
+
+        let body = serde_json::json!({
+            "receive_id": receive_id,
+            "msg_type": msg_type,
+            "content": wire_content,
+        });
+
+        let (status, response) = self.send_text_once(&url, &token, &body).await?;
+
+        if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let (retry_status, retry_response) =
+                self.send_text_once(&url, &new_token, &body).await?;
+
+            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                anyhow::bail!(
+                    "Lark send_raw_message_with_id failed after token refresh: \
+                     status={retry_status}, body={retry_response}"
+                );
+            }
+
+            ensure_lark_send_success(
+                retry_status,
+                &retry_response,
+                "send_raw_with_id after refresh",
+            )?;
+            return extract_message_id(&retry_response);
+        }
+
+        ensure_lark_send_success(status, &response, "send_raw_with_id")?;
+        extract_message_id(&response)
+    }
+
+    /// Create a streaming card entity via CardKit API.
+    ///
+    /// `POST {api_base}/cardkit/v1/cards` with a card JSON that has
+    /// `streaming_mode: true` and an initial markdown element (element_id: "content").
+    /// Returns the `card_id` from the response.
+    async fn cardkit_create_card(&self, token: &str) -> anyhow::Result<String> {
+        let url = format!("{}/cardkit/v1/cards", self.api_base());
+
+        let card_json = serde_json::json!({
+            "schema": "2.0",
+            "config": {
+                "streaming_mode": true,
+                "summary": { "content": "[Generating...]" },
+                "streaming_config": {
+                    "print_frequency_ms": { "default": 50 },
+                    "print_step": { "default": 2 }
+                }
+            },
+            "body": {
+                "elements": [{
+                    "tag": "markdown",
+                    "content": "⏳",
+                    "element_id": "content"
+                }]
+            }
+        });
+
+        let body = serde_json::json!({
+            "type": "card_json",
+            "data": card_json.to_string(),
+        });
+
+        let (_status, response) = self.send_text_once(&url, token, &body).await?;
+
+        let code = extract_lark_response_code(&response).unwrap_or(0);
+        if code != 0 {
+            let msg = response
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            anyhow::bail!(
+                "CardKit create card failed: code={code}, msg={msg}"
+            );
+        }
+
+        response
+            .pointer("/data/card_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("missing data.card_id in CardKit response: {response}"))
+    }
+
+    /// Update the markdown content of a streaming card element.
+    async fn cardkit_update_content(
+        &self,
+        token: &str,
+        card_id: &str,
+        content: &str,
+        sequence: u64,
+    ) -> anyhow::Result<()> {
+        let url = format!(
+            "{}/cardkit/v1/cards/{}/elements/content/content",
+            self.api_base(),
+            card_id,
+        );
+
+        let uuid = format!("s_{card_id}_{sequence}");
+
+        let body = serde_json::json!({
+            "content": content,
+            "sequence": sequence,
+            "uuid": uuid,
+        });
+
+        let resp = self
+            .http_client()
+            .put(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+
+        let code = extract_lark_response_code(&parsed).unwrap_or(0);
+        if code != 0 {
+            let msg = parsed
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            anyhow::bail!(
+                "CardKit update content failed: code={code}, msg={msg}, status={status}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Close streaming mode on a CardKit card.
+    async fn cardkit_close_streaming(
+        &self,
+        token: &str,
+        card_id: &str,
+        summary: &str,
+        sequence: u64,
+    ) -> anyhow::Result<()> {
+        let url = format!(
+            "{}/cardkit/v1/cards/{}/settings",
+            self.api_base(),
+            card_id,
+        );
+
+        let uuid = format!("c_{card_id}_{sequence}");
+
+        let settings = serde_json::json!({
+            "config": {
+                "streaming_mode": false,
+                "summary": { "content": summary }
+            }
+        });
+
+        let body = serde_json::json!({
+            "settings": settings.to_string(),
+            "sequence": sequence,
+            "uuid": uuid,
+        });
+
+        let resp = self
+            .http_client()
+            .patch(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+
+        let code = extract_lark_response_code(&parsed).unwrap_or(0);
+        if code != 0 {
+            let msg = parsed
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            anyhow::bail!(
+                "CardKit close streaming failed: code={code}, msg={msg}, status={status}"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Parse an event callback payload and extract text messages
     pub fn parse_event_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
         let mut messages = Vec::new();
@@ -1075,6 +1354,195 @@ impl Channel for LarkChannel {
     async fn health_check(&self) -> bool {
         self.get_tenant_access_token().await.is_ok()
     }
+
+    fn supports_draft_updates(&self) -> bool {
+        self.streaming_enabled
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if !self.streaming_enabled {
+            return Ok(None);
+        }
+
+        // 1. Get token and create streaming card.
+        //    cardkit_create_card does not handle token retry internally,
+        //    so we wrap it with the standard refresh-once pattern.
+        let token = self.get_tenant_access_token().await?;
+        let card_id = match self.cardkit_create_card(&token).await {
+            Ok(id) => id,
+            Err(first_err) => {
+                // Heuristic: if the error contains the Lark invalid-token code,
+                // refresh the token and retry once.
+                if first_err.to_string().contains("99991663") {
+                    self.invalidate_token().await;
+                    let new_token = self.get_tenant_access_token().await?;
+                    self.cardkit_create_card(&new_token).await?
+                } else {
+                    return Err(first_err);
+                }
+            }
+        };
+
+        // 2. Send interactive message with the card.
+        //    send_raw_message_with_id handles token retry internally.
+        let content = serde_json::json!({
+            "type": "card",
+            "data": { "card_id": &card_id }
+        })
+        .to_string();
+
+        let message_id = self
+            .send_raw_message_with_id(&message.recipient, "chat_id", "interactive", &content)
+            .await?;
+
+        // 3. Initialize sequence counter for this card.
+        {
+            let mut state = self.streaming_state.lock().await;
+            state.sequences.insert(card_id.clone(), 1);
+        }
+
+        // 4. Return encoded draft ID.
+        Ok(Some(encode_draft_id(&card_id, &message_id)))
+    }
+
+    async fn update_draft(
+        &self,
+        _recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let (card_id, _msg_id) = decode_draft_id(message_id)?;
+        let card_id = card_id.to_string();
+
+        let mut state = self.streaming_state.lock().await;
+
+        // Throttle check: if less than 100ms since last update, save pending and return.
+        let now = Instant::now();
+        if let Some(last) = state.last_update_time {
+            if now.duration_since(last) < Duration::from_millis(100) {
+                state.pending_text = Some(text.to_string());
+                return Ok(());
+            }
+        }
+
+        // Increment sequence number.
+        let seq = state.sequences.entry(card_id.clone()).or_insert(1);
+        *seq += 1;
+        let sequence = *seq;
+
+        // Clear pending_text since we are sending the current (latest) text now.
+        state.pending_text = None;
+
+        // Get token and send update (lock held for serial execution).
+        let token = match self.get_tenant_access_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("streaming update_draft: failed to get token: {e}");
+                return Ok(());
+            }
+        };
+
+        if let Err(e) = self
+            .cardkit_update_content(&token, &card_id, text, sequence)
+            .await
+        {
+            tracing::warn!("streaming update_draft: cardkit_update_content failed: {e}");
+        } else {
+            state.last_update_time = Some(Instant::now());
+        }
+
+        Ok(())
+    }
+
+    async fn finalize_draft(
+        &self,
+        _recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let (card_id, _msg_id) = decode_draft_id(message_id)?;
+        let card_id = card_id.to_string();
+
+        let mut state = self.streaming_state.lock().await;
+
+        let token = match self.get_tenant_access_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("streaming finalize_draft: failed to get token: {e}");
+                // Clean up state even on token failure.
+                state.sequences.remove(&card_id);
+                state.pending_text = None;
+                return Ok(());
+            }
+        };
+
+        // Increment sequence and send final content update.
+        let cur = state.sequences.entry(card_id.clone()).or_insert(1);
+        *cur += 1;
+        let update_seq = *cur;
+
+        if let Err(e) = self
+            .cardkit_update_content(&token, &card_id, text, update_seq)
+            .await
+        {
+            tracing::warn!("streaming finalize_draft: final content update failed: {e}");
+        }
+
+        // Close streaming mode with an incremented sequence.
+        let cur = state.sequences.entry(card_id.clone()).or_insert(update_seq);
+        *cur += 1;
+        let close_seq = *cur;
+
+        let summary = truncate_summary(text, 50);
+        if let Err(e) = self
+            .cardkit_close_streaming(&token, &card_id, &summary, close_seq)
+            .await
+        {
+            tracing::warn!("streaming finalize_draft: cardkit_close_streaming failed: {e}");
+        }
+
+        // Clean up sequence state and pending text.
+        state.sequences.remove(&card_id);
+        state.pending_text = None;
+
+        Ok(())
+    }
+
+    async fn cancel_draft(&self, _recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        let (card_id, _msg_id) = decode_draft_id(message_id)?;
+        let card_id = card_id.to_string();
+
+        let mut state = self.streaming_state.lock().await;
+
+        let token = match self.get_tenant_access_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("streaming cancel_draft: failed to get token: {e}");
+                state.sequences.remove(&card_id);
+                state.pending_text = None;
+                return Ok(());
+            }
+        };
+
+        // Increment sequence for the close call.
+        let cur = state.sequences.entry(card_id.clone()).or_insert(1);
+        *cur += 1;
+        let close_seq = *cur;
+
+        // Close streaming mode without sending a content update.
+        if let Err(e) = self
+            .cardkit_close_streaming(&token, &card_id, "", close_seq)
+            .await
+        {
+            tracing::warn!("streaming cancel_draft: cardkit_close_streaming failed: {e}");
+        }
+
+        // Clean up sequence state and pending text.
+        state.sequences.remove(&card_id);
+        state.pending_text = None;
+
+        Ok(())
+    }
 }
 
 impl LarkChannel {
@@ -1176,12 +1644,14 @@ impl LarkChannel {
 
 fn pick_uniform_index(len: usize) -> usize {
     debug_assert!(len > 0);
+    #[allow(clippy::cast_possible_truncation)]
     let upper = len as u64;
     let reject_threshold = (u64::MAX / upper) * upper;
 
     loop {
         let value = rand::random::<u64>();
         if value < reject_threshold {
+            #[allow(clippy::cast_possible_truncation)]
             return (value % upper) as usize;
         }
     }
@@ -1822,6 +2292,7 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::default(),
             port: None,
+            streaming: true,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -1843,6 +2314,7 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            streaming: false,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -1875,6 +2347,7 @@ mod tests {
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            streaming: true,
         };
 
         let ch = LarkChannel::from_config(&cfg);
@@ -1898,6 +2371,7 @@ mod tests {
             use_feishu: true,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            streaming: true,
         };
 
         let ch = LarkChannel::from_lark_config(&cfg);
@@ -1919,6 +2393,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            streaming: true,
         };
 
         let ch = LarkChannel::from_feishu_config(&cfg);
@@ -1971,6 +2446,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: crate::config::schema::LarkReceiveMode::Webhook,
             port: Some(9898),
+            streaming: true,
         };
         let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
         assert_eq!(

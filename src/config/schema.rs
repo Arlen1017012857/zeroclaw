@@ -3007,6 +3007,10 @@ pub enum LarkReceiveMode {
     Webhook,
 }
 
+fn default_streaming_enabled() -> bool {
+    true
+}
+
 /// Lark/Feishu configuration for messaging integration.
 /// Lark is the international version; Feishu is the Chinese version.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3036,6 +3040,9 @@ pub struct LarkConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Enable streaming card output via CardKit API (default: true)
+    #[serde(default = "default_streaming_enabled")]
+    pub streaming: bool,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -3070,6 +3077,9 @@ pub struct FeishuConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Enable streaming card output via CardKit API (default: true)
+    #[serde(default = "default_streaming_enabled")]
+    pub streaming: bool,
 }
 
 impl ChannelConfig for FeishuConfig {
@@ -6777,6 +6787,7 @@ default_model = "legacy-model"
             use_feishu: true,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            streaming: true,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -6786,6 +6797,7 @@ default_model = "legacy-model"
         assert_eq!(parsed.verification_token.as_deref(), Some("verify_token"));
         assert_eq!(parsed.allowed_users.len(), 2);
         assert!(parsed.use_feishu);
+        assert!(parsed.streaming);
     }
 
     #[test]
@@ -6799,12 +6811,14 @@ default_model = "legacy-model"
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            streaming: false,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.app_id, "cli_123456");
         assert_eq!(parsed.app_secret, "secret_abc");
         assert!(!parsed.use_feishu);
+        assert!(!parsed.streaming);
     }
 
     #[test]
@@ -6844,6 +6858,7 @@ default_model = "legacy-model"
             allowed_users: vec!["user_123".into(), "user_456".into()],
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            streaming: true,
         };
         let json = serde_json::to_string(&fc).unwrap();
         let parsed: FeishuConfig = serde_json::from_str(&json).unwrap();
@@ -6852,6 +6867,7 @@ default_model = "legacy-model"
         assert_eq!(parsed.encrypt_key.as_deref(), Some("encrypt_key"));
         assert_eq!(parsed.verification_token.as_deref(), Some("verify_token"));
         assert_eq!(parsed.allowed_users.len(), 2);
+        assert!(parsed.streaming);
     }
 
     #[test]
@@ -6864,6 +6880,7 @@ default_model = "legacy-model"
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            streaming: false,
         };
         let toml_str = toml::to_string(&fc).unwrap();
         let parsed: FeishuConfig = toml::from_str(&toml_str).unwrap();
@@ -6871,6 +6888,7 @@ default_model = "legacy-model"
         assert_eq!(parsed.app_secret, "secret_abc");
         assert_eq!(parsed.receive_mode, LarkReceiveMode::Webhook);
         assert_eq!(parsed.port, Some(9898));
+        assert!(!parsed.streaming);
     }
 
     #[test]

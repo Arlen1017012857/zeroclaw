@@ -64,6 +64,7 @@ mod tests {
             use_feishu: false,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            streaming: true,
         };
         let feishu = FeishuConfig {
             app_id: "app-id".into(),
@@ -73,6 +74,7 @@ mod tests {
             allowed_users: vec![],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            streaming: true,
         };
 
         let nextcloud_talk = NextcloudTalkConfig {

@@ -4719,6 +4719,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         allowed_users,
                         receive_mode,
                         port,
+                        streaming: true,
                     });
                 } else {
                     config.lark = Some(LarkConfig {
@@ -4730,6 +4731,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         use_feishu: false,
                         receive_mode,
                         port,
+                        streaming: true,
                     });
                 }
             }
@@ -6944,6 +6946,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            streaming: true,
         });
         assert!(has_launchable_channels(&channels));
     }
