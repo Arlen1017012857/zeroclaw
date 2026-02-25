@@ -2309,10 +2309,18 @@ pub struct CronConfig {
     /// Maximum number of historical cron run records to retain. Default: `50`.
     #[serde(default = "default_max_run_history")]
     pub max_run_history: u32,
+    /// Default IANA timezone for cron schedules when none is specified.
+    /// Default: `"Asia/Shanghai"`.
+    #[serde(default = "default_cron_tz")]
+    pub default_tz: String,
 }
 
 fn default_max_run_history() -> u32 {
     50
+}
+
+fn default_cron_tz() -> String {
+    "Asia/Shanghai".to_string()
 }
 
 impl Default for CronConfig {
@@ -2320,6 +2328,7 @@ impl Default for CronConfig {
         Self {
             enabled: true,
             max_run_history: default_max_run_history(),
+            default_tz: default_cron_tz(),
         }
     }
 }
@@ -4581,6 +4590,7 @@ mod tests {
         let c = CronConfig::default();
         assert!(c.enabled);
         assert_eq!(c.max_run_history, 50);
+        assert_eq!(c.default_tz, "Asia/Shanghai");
     }
 
     #[test]
@@ -4588,11 +4598,13 @@ mod tests {
         let c = CronConfig {
             enabled: false,
             max_run_history: 100,
+            default_tz: "Europe/London".to_string(),
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: CronConfig = serde_json::from_str(&json).unwrap();
         assert!(!parsed.enabled);
         assert_eq!(parsed.max_run_history, 100);
+        assert_eq!(parsed.default_tz, "Europe/London");
     }
 
     #[test]
@@ -4606,6 +4618,7 @@ default_temperature = 0.7
         let parsed: Config = toml::from_str(toml_str).unwrap();
         assert!(parsed.cron.enabled);
         assert_eq!(parsed.cron.max_run_history, 50);
+        assert_eq!(parsed.cron.default_tz, "Asia/Shanghai");
     }
 
     #[test]

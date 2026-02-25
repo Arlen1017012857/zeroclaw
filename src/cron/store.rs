@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::cron::{
-    next_run_for_schedule, schedule_cron_expression, validate_schedule, CronJob, CronJobPatch,
-    CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
+    next_run_for_schedule_with_default_tz, schedule_cron_expression, validate_schedule, CronJob,
+    CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -35,7 +35,8 @@ pub fn add_shell_job(
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
-    let next_run = next_run_for_schedule(&schedule, now)?;
+    let default_tz = config.cron.default_tz.as_str();
+    let next_run = next_run_for_schedule_with_default_tz(&schedule, now, Some(default_tz))?;
     let id = Uuid::new_v4().to_string();
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
     let schedule_json = serde_json::to_string(&schedule)?;
@@ -77,7 +78,8 @@ pub fn add_agent_job(
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
-    let next_run = next_run_for_schedule(&schedule, now)?;
+    let default_tz = config.cron.default_tz.as_str();
+    let next_run = next_run_for_schedule_with_default_tz(&schedule, now, Some(default_tz))?;
     let id = Uuid::new_v4().to_string();
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
     let schedule_json = serde_json::to_string(&schedule)?;
@@ -218,7 +220,9 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
     }
 
     if schedule_changed {
-        job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
+        let default_tz = config.cron.default_tz.as_str();
+        job.next_run =
+            next_run_for_schedule_with_default_tz(&job.schedule, Utc::now(), Some(default_tz))?;
     }
 
     with_connection(config, |conn| {
@@ -279,7 +283,8 @@ pub fn reschedule_after_run(
     output: &str,
 ) -> Result<()> {
     let now = Utc::now();
-    let next_run = next_run_for_schedule(&job.schedule, now)?;
+    let default_tz = config.cron.default_tz.as_str();
+    let next_run = next_run_for_schedule_with_default_tz(&job.schedule, now, Some(default_tz))?;
     let status = if success { "ok" } else { "error" };
     let bounded_output = truncate_cron_output(output);
 

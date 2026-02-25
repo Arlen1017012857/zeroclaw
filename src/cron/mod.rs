@@ -10,7 +10,8 @@ pub mod scheduler;
 
 #[allow(unused_imports)]
 pub use schedule::{
-    next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule,
+    next_run_for_schedule, next_run_for_schedule_with_default_tz, normalize_expression,
+    schedule_cron_expression, validate_schedule,
 };
 #[allow(unused_imports)]
 pub use store::{

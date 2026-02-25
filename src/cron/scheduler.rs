@@ -3,8 +3,9 @@ use crate::channels::{
 };
 use crate::config::Config;
 use crate::cron::{
-    due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
-    update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
+    due_jobs, next_run_for_schedule_with_default_tz, record_last_run, record_run, remove_job,
+    reschedule_after_run, update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule,
+    SessionTarget,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -125,7 +126,7 @@ async fn execute_and_persist_job(
     component: &str,
 ) -> (String, bool) {
     crate::health::mark_component_ok(component);
-    warn_if_high_frequency_agent_job(job);
+    warn_if_high_frequency_agent_job(config, job);
 
     let started_at = Utc::now();
     let (success, output) = execute_job_with_retry(config, security, job).await;
@@ -254,17 +255,22 @@ fn is_one_shot_auto_delete(job: &CronJob) -> bool {
     job.delete_after_run && matches!(job.schedule, Schedule::At { .. })
 }
 
-fn warn_if_high_frequency_agent_job(job: &CronJob) {
+fn warn_if_high_frequency_agent_job(config: &Config, job: &CronJob) {
     if !matches!(job.job_type, JobType::Agent) {
         return;
     }
+    let default_tz = config.cron.default_tz.as_str();
     let too_frequent = match &job.schedule {
         Schedule::Every { every_ms } => *every_ms < 5 * 60 * 1000,
         Schedule::Cron { .. } => {
             let now = Utc::now();
             match (
-                next_run_for_schedule(&job.schedule, now),
-                next_run_for_schedule(&job.schedule, now + chrono::Duration::seconds(1)),
+                next_run_for_schedule_with_default_tz(&job.schedule, now, Some(default_tz)),
+                next_run_for_schedule_with_default_tz(
+                    &job.schedule,
+                    now + chrono::Duration::seconds(1),
+                    Some(default_tz),
+                ),
             ) {
                 (Ok(a), Ok(b)) => (b - a).num_minutes() < 5,
                 _ => false,

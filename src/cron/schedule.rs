@@ -5,13 +5,22 @@ use cron::Schedule as CronExprSchedule;
 use std::str::FromStr;
 
 pub fn next_run_for_schedule(schedule: &Schedule, from: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    next_run_for_schedule_with_default_tz(schedule, from, None)
+}
+
+pub fn next_run_for_schedule_with_default_tz(
+    schedule: &Schedule,
+    from: DateTime<Utc>,
+    default_tz: Option<&str>,
+) -> Result<DateTime<Utc>> {
     match schedule {
         Schedule::Cron { expr, tz } => {
             let normalized = normalize_expression(expr)?;
             let cron = CronExprSchedule::from_str(&normalized)
                 .with_context(|| format!("Invalid cron expression: {expr}"))?;
 
-            if let Some(tz_name) = tz {
+            let effective_tz = tz.as_deref().or(default_tz);
+            if let Some(tz_name) = effective_tz {
                 let timezone = chrono_tz::Tz::from_str(tz_name)
                     .with_context(|| format!("Invalid IANA timezone: {tz_name}"))?;
                 let localized_from = from.with_timezone(&timezone);
@@ -109,6 +118,34 @@ mod tests {
         };
 
         let next = next_run_for_schedule(&schedule, from).unwrap();
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 2, 16, 17, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn default_tz_applies_when_schedule_has_no_tz() {
+        let from = Utc.with_ymd_and_hms(2026, 2, 16, 0, 0, 0).unwrap();
+        let schedule = Schedule::Cron {
+            expr: "0 9 * * *".into(),
+            tz: None,
+        };
+
+        // With default_tz = Asia/Shanghai (UTC+8), 09:00 Shanghai = 01:00 UTC
+        let next =
+            next_run_for_schedule_with_default_tz(&schedule, from, Some("Asia/Shanghai")).unwrap();
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 2, 16, 1, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn explicit_tz_overrides_default_tz() {
+        let from = Utc.with_ymd_and_hms(2026, 2, 16, 0, 0, 0).unwrap();
+        let schedule = Schedule::Cron {
+            expr: "0 9 * * *".into(),
+            tz: Some("America/Los_Angeles".into()),
+        };
+
+        // Explicit tz should win over default_tz
+        let next =
+            next_run_for_schedule_with_default_tz(&schedule, from, Some("Asia/Shanghai")).unwrap();
         assert_eq!(next, Utc.with_ymd_and_hms(2026, 2, 16, 17, 0, 0).unwrap());
     }
 }
