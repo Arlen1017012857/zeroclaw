@@ -24,11 +24,9 @@ pub mod uno_q_setup;
 #[cfg(all(feature = "peripheral-rpi", target_os = "linux"))]
 pub mod rpi;
 
-pub use traits::Peripheral;
-
 use crate::config::{Config, PeripheralBoardConfig, PeripheralsConfig};
 #[cfg(feature = "hardware")]
-use crate::tools::HardwareMemoryMapTool;
+use crate::tools::hardware_memory_map::HardwareMemoryMapTool;
 use crate::tools::Tool;
 use anyhow::Result;
 
@@ -209,12 +207,12 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
     if !tools.is_empty() {
         let board_names: Vec<String> = config.boards.iter().map(|b| b.board.clone()).collect();
         tools.push(Box::new(HardwareMemoryMapTool::new(board_names.clone())));
-        tools.push(Box::new(crate::tools::HardwareBoardInfoTool::new(
-            board_names.clone(),
-        )));
-        tools.push(Box::new(crate::tools::HardwareMemoryReadTool::new(
-            board_names,
-        )));
+        tools.push(Box::new(
+            crate::tools::hardware_board_info::HardwareBoardInfoTool::new(board_names.clone()),
+        ));
+        tools.push(Box::new(
+            crate::tools::hardware_memory_read::HardwareMemoryReadTool::new(board_names),
+        ));
     }
 
     // Phase C: Add hardware_capabilities tool when any serial boards

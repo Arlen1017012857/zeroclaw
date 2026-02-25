@@ -2612,7 +2612,7 @@ mod tests {
             "update_id": 1,
             "message": {
                 "message_id": 99,
-                "chat": { "id": -100123456 }
+                "chat": { "id": -100_123_456 }
             }
         });
 
@@ -3952,7 +3952,7 @@ mod tests {
     /// Skipped automatically when `GROQ_API_KEY` is not set.
     /// Run: `GROQ_API_KEY=<key> cargo test --lib -- telegram::tests::e2e_live_voice_transcription_and_reply_cache --ignored`
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires GROQ_API_KEY and network access"]
     async fn e2e_live_voice_transcription_and_reply_cache() {
         if std::env::var("GROQ_API_KEY").is_err() {
             eprintln!("GROQ_API_KEY not set — skipping live voice transcription test");

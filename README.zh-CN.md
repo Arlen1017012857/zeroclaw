@@ -304,3 +304,10 @@ allow_public_bind = false
 ---
 
 如果你需要完整实现细节（架构图、全部命令、完整 API、开发流程），请直接阅读英文主文档：[`README.md`](README.md)。
+
+
+
+
+cargo build --release --features channel-lark --locked
+cargo install --path . --force --locked --features channel-lark
+zeroclaw channel start  
